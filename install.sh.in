@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+version=1.1.0
+manifest_sha256='@MANIFEST_SHA256@'
+base_url='https://github.com/SevenFo/cxi'
+shell_choice=auto
+install_root="${XDG_DATA_HOME:-$HOME/.local/share}/cxi"
+from_directory=''
+update_rc=1
+stage=''
+lock=''
+
+fail() { printf 'cxi installer: %s\n' "$*" >&2; exit 1; }
+usage() {
+  printf '%s\n' 'Usage: bash install.sh [--shell bash|zsh|both] [--no-rc] [--prefix ABSOLUTE_PATH] [--base-url HTTPS_URL] [--from-dir RELEASE_DIR]'
+}
+while (( $# )); do
+  case "$1" in
+    --shell|--prefix|--base-url|--from-dir)
+      [[ $# -ge 2 && -n "$2" ]] || fail "missing value for $1"
+      case "$1" in
+        --shell) shell_choice="$2" ;;
+        --prefix) install_root="$2" ;;
+        --base-url) base_url="${2%/}" ;;
+        --from-dir) from_directory="$2" ;;
+      esac
+      shift 2
+      ;;
+    --no-rc) update_rc=0; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) fail "unknown option: $1" ;;
+  esac
+done
+if [[ "$shell_choice" == auto ]]; then
+  case "${SHELL:-}" in */bash) shell_choice=bash ;; */zsh) shell_choice=zsh ;; *) shell_choice=both ;; esac
+fi
+case "$shell_choice" in bash|zsh|both) ;; *) fail 'unsupported --shell value' ;; esac
+[[ "$install_root" == /* && "$install_root" != / && ! -L "$install_root" ]] || fail '--prefix must be an absolute, non-symlink directory other than /'
+[[ "$install_root" != *$'\n'* ]] || fail 'installation paths must not contain newlines'
+while [[ "$install_root" != / && "$install_root" == */ ]]; do install_root="${install_root%/}"; done
+[[ "$install_root" != / ]] || fail 'installation root must not be /'
+[[ ! -L "$install_root" && ! -L "$install_root/releases" ]] || fail 'installation root and releases must not be symlinks'
+[[ -n "$from_directory" || "$base_url" == https://* ]] || fail 'downloads require HTTPS'
+[[ ${#manifest_sha256} -eq 64 && "$manifest_sha256" != *[!0-9a-f]* ]] || fail 'this is a source template; run build-cxi-release.py first'
+
+digest() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d ' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then shasum -a 256 "$1" | cut -d ' ' -f1
+  else fail 'sha256sum or shasum is required'; fi
+}
+fetch() {
+  local filename="$1" destination="$2"
+  if [[ -n "$from_directory" ]]; then
+    [[ -f "$from_directory/$filename" && ! -L "$from_directory/$filename" ]] || fail "missing release file: $filename"
+    cp -- "$from_directory/$filename" "$destination"
+  else
+    command -v curl >/dev/null 2>&1 || fail 'curl is required'
+    curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+      --connect-timeout 10 --max-time 60 --retry 2 \
+      "$base_url/releases/download/v$version/$filename" -o "$destination"
+  fi
+}
+
+mkdir -p -- "$install_root"
+install_root=$(cd -- "$install_root" && pwd -P)
+[[ "$install_root" != / && ! -L "$install_root/releases" ]] || fail 'unsafe installation root'
+mkdir -p -- "$install_root/releases"
+chmod 700 "$install_root"
+lock="$install_root/.install.lock"
+mkdir -- "$lock" || fail "another install is in progress; if interrupted, inspect $lock before removing it"
+trap '[[ -z "$stage" ]] || command rm -rf -- "$stage"; [[ -z "$lock" ]] || rmdir -- "$lock"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+stage=$(mktemp -d "$install_root/.install.XXXXXXXX")
+fetch SHA256SUMS "$stage/SHA256SUMS"
+[[ "$(digest "$stage/SHA256SUMS")" == "$manifest_sha256" ]] || fail 'manifest checksum mismatch'
+for filename in cxi-core.sh cxi.bash cxi.zsh README.md; do
+  expected=$(awk -v filename="$filename" '$2 == filename { print $1 }' "$stage/SHA256SUMS")
+  [[ ${#expected} -eq 64 && "$expected" != *[!0-9a-f]* ]] || fail "invalid manifest entry: $filename"
+  fetch "$filename" "$stage/$filename"
+  [[ "$(digest "$stage/$filename")" == "$expected" ]] || fail "checksum mismatch: $filename"
+  chmod 600 "$stage/$filename"
+done
+bash -n "$stage/cxi-core.sh"
+bash -n "$stage/cxi.bash"
+if command -v zsh >/dev/null 2>&1; then zsh -n "$stage/cxi.zsh"; fi
+
+release="$install_root/releases/$version"
+[[ ! -L "$release" ]] || fail 'release directory must not be a symlink'
+if [[ -e "$release" ]]; then
+  [[ -d "$release" ]] || fail 'release destination is not a directory'
+  for filename in SHA256SUMS cxi-core.sh cxi.bash cxi.zsh README.md; do
+    [[ -f "$release/$filename" && ! -L "$release/$filename" ]] && cmp -s "$stage/$filename" "$release/$filename" || fail "existing release differs: $release/$filename"
+  done
+else
+  mv -- "$stage" "$release"
+  stage=''
+fi
+
+stage=$(mktemp -d "$install_root/.entrypoints.XXXXXXXX")
+for selected_shell in bash zsh; do
+  printf 'source %q\n' "$release/cxi.$selected_shell" > "$stage/cxi.$selected_shell"
+  [[ ! -d "$install_root/cxi.$selected_shell" && ! -L "$install_root/cxi.$selected_shell" ]] || fail 'entrypoint destination must not be a directory or symlink'
+  mv -f -- "$stage/cxi.$selected_shell" "$install_root/cxi.$selected_shell"
+done
+
+if [[ "$update_rc" == 1 ]]; then
+  for selected_shell in bash zsh; do
+    [[ "$shell_choice" == both || "$shell_choice" == "$selected_shell" ]] || continue
+    if [[ "$selected_shell" == zsh ]]; then rc="${ZDOTDIR:-$HOME}/.zshrc"; else rc="$HOME/.bashrc"; fi
+    [[ ! -L "$rc" && ( ! -e "$rc" || -f "$rc" ) ]] || fail "refusing non-regular or symlink rc file: $rc (use --no-rc)"
+    source_line=$(printf 'source %q' "$install_root/cxi.$selected_shell")
+    if [[ ! -f "$rc" ]] || ! grep -Fqx -- "$source_line" "$rc"; then
+      backup="$rc.cxi-backup-$(date +%Y%m%d%H%M%S)-$$"
+      if [[ -e "$rc" ]]; then cp -p -- "$rc" "$backup"; fi
+      printf '\n%s\n' "$source_line" >> "$rc"
+    fi
+  done
+fi
+printf 'Installed cxi %s (%s) in %s\n' "$version" "$shell_choice" "$install_root"
+for selected_shell in bash zsh; do
+  [[ "$shell_choice" == both || "$shell_choice" == "$selected_shell" ]] || continue
+  printf 'Load in %s now: source %q\n' "$selected_shell" "$install_root/cxi.$selected_shell"
+done
+printf '%s\n' 'No Codex login or daemon was started. Existing Codex homes were not modified.'
